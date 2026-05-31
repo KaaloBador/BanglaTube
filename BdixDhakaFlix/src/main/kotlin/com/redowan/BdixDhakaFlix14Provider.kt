@@ -1,6 +1,7 @@
 package com.redowan
 
 
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -27,16 +28,14 @@ import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
-
-//suspend fun main() {
-//    val providerTester = com.lagradost.cloudstreamtest.ProviderTester(BdixDhakaFlix14Provider())
-////    providerTester.testAll()
-////    providerTester.testMainPage(verbose = true)
-////   providerTester.testSearch(query = "dragon", verbose = true)
-////    providerTester.testLoad("http://172.16.50.14/DHAKA-FLIX-14/Animation%20Movies%20%281080p%29/009%20Re-Cyborg%20%282012%29%201080p%20%5BDual%20Audio%5D/")
-//    //Tv Series
-//    providerTester.testLoad("http://172.16.50.14/DHAKA-FLIX-14/KOREAN%20TV%20%26%20WEB%20Series/Squid%20Game%20%28TV%20Series%202021%E2%80%932025%29%201080p%20%5BMulti%20Audio%5D/")
-//}
+data class TmdbSearchResponse(val results: List<TmdbItem>?)
+data class TmdbItem(
+    val id: Int?,
+    @JsonProperty("poster_path") val posterPath: String?,
+    @JsonProperty("overview") val overview: String?,
+    @JsonProperty("release_date") val releaseDate: String?,
+    @JsonProperty("first_air_date") val firstAirDate: String?
+)
 
 open class BdixDhakaFlix14Provider : MainAPI() {
     override var mainUrl = "http://172.16.50.14"
@@ -50,7 +49,7 @@ open class BdixDhakaFlix14Provider : MainAPI() {
         TvType.Movie, TvType.AnimeMovie, TvType.TvSeries
     )
     open val year = 2025
-    open val tvSeriesKeyword: List<String>? = listOf("KOREAN%20TV%20%26%20WEB%20Series")
+    open val tvSeriesKeyword: List<String>? = listOf("KOREAN%20TV%20%26%20WEB%20Series", "TV-WEB-Series")
     open val serverName: String = "DHAKA-FLIX-14"
 
     override val mainPage = mainPageOf(
@@ -62,6 +61,35 @@ open class BdixDhakaFlix14Provider : MainAPI() {
         "SOUTH INDIAN MOVIES/South Movies/$year/" to "South Movies",
         "/KOREAN TV %26 WEB Series/" to "Korean TV & WEB Series"
     )
+
+    private fun cleanTitle(title: String): String {
+        return title
+            // 1. Remove Prefixes like "01-", "007 ", "009 "
+            .replace(Regex("""^\d{2,3}[- ]"""), "")
+            // 2. Remove Type & Year blocks like "(TV Series 2011–2017)" or "(2024– )" or "[2004]"
+            .replace(Regex("""(?i)\((?:TV\s(?:Mini[- ]?)?Series|TV\sCartoon|TV\sMini-Series)\s?\d{4}.*?\)|[\(\[]\d{4}.*?[\)\]]"""), "")
+            // 3. Remove Technical Tags: 1080p, 720p, [Dual Audio], (Dual Audio), NF, AMZN, HDRip, etc.
+            .replace(Regex("""(?i)\d{3,4}p|\[.*?\]|\((?:Dual|Multi|Bangla|Tamil|Telugu|English|Hindi)\sAudio\)|NF|AMZN|HDRip|WEBRip|AMZN|Bluray|Web-Dl"""), "")
+            .replace("  ", " ")
+            .trim()
+    }
+
+    private suspend fun getExternalMetadata(rawName: String, isTv: Boolean): TmdbItem? {
+        val clean = cleanTitle(rawName)
+        val type = if (isTv) "tv" else "movie"
+        return try {
+            app.get(
+                "https://api.themoviedb.org/3/search/$type",
+                params = mapOf(
+                    "api_key" to "e6333b32409e02a4a6eba6fb7ff866bb",
+                    "query" to clean
+                ),
+                timeout = 10
+            ).parsed<TmdbSearchResponse>().results?.firstOrNull()
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     override suspend fun getMainPage(
         page: Int, request: MainPageRequest
@@ -132,20 +160,35 @@ open class BdixDhakaFlix14Provider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
-        val imageLink = mainUrl + doc.select("td.fb-n > a[href~=(?i)\\.(png|jpe?g)]").attr("href")
+        val rawName = nameFromUrl(url)
+        val isTv = containsAnyLoop(url, tvSeriesKeyword)
+
+        // Metadata Enrichment
+        val meta = getExternalMetadata(rawName, isTv)
+        val tmdbPoster = meta?.posterPath?.let { "https://image.tmdb.org/t/p/w500$it" }
+        
+        // Local Poster Search
+        val allImages = doc.select("td.fb-n > a[href~=(?i)\\.(png|jpe?g)]").map { it.attr("href") }
+        val posterPath = allImages.find { img ->
+            val lower = img.lowercase()
+            lower.contains("a_al_") || lower.contains("a11") || lower.contains("poster") || lower.contains("folder")
+        } ?: allImages.firstOrNull()
+        
+        val localPoster = if (posterPath != null) mainUrl + posterPath else null
+        val finalPoster = tmdbPoster ?: localPoster
+
         val tableHtml = doc.select("tbody > tr:gt(1)")
 
-        if (containsAnyLoop(url, tvSeriesKeyword)) {
+        if (isTv) {
             val episodesData = mutableListOf<Episode>()
             var seasonNum = 0
-            val name = nameFromUrl(url)
             tableHtml.forEach {
-                seasonNum++
                 val aHtml = it.selectFirst("td.fb-n > a")
                 val link = mainUrl + aHtml?.attr("href")
                 if (it.selectFirst("td.fb-i > img")?.attr("alt") == "folder") {
+                    seasonNum++
                     seasonExtractor(link, episodesData, seasonNum)
-                } else if (aHtml?.selectFirst("a[href~=(?i)\\.(mkv|mp4)]") != null) {
+                } else if (aHtml?.attr("href")?.contains(Regex("(?i)\\.(mkv|mp4)")) == true) {
                     val tittle = aHtml.text()
                     episodesData.add(
                         newEpisode(link) {
@@ -156,15 +199,21 @@ open class BdixDhakaFlix14Provider : MainAPI() {
                 }
             }
 
-            return newTvSeriesLoadResponse(name, url, TvType.TvSeries, episodesData) {
-                this.posterUrl = imageLink
+            return newTvSeriesLoadResponse(rawName, url, TvType.TvSeries, episodesData) {
+                this.posterUrl = finalPoster
+                this.plot = meta?.overview
+                this.year = (meta?.firstAirDate ?: meta?.releaseDate)?.split("-")?.firstOrNull()?.toIntOrNull()
+                meta?.id?.let { addTMDbId(it.toString()) }
             }
         } else {
             val folderHtml = tableHtml.select("td.fb-n > a[href~=(?i)\\.(mkv|mp4)]")
             val name = folderHtml.text().toString()
             val link = mainUrl + folderHtml.attr("href")
             return newMovieLoadResponse(name, url, TvType.Movie, link) {
-                this.posterUrl = imageLink
+                this.posterUrl = finalPoster
+                this.plot = meta?.overview
+                this.year = meta?.releaseDate?.split("-")?.firstOrNull()?.toIntOrNull()
+                meta?.id?.let { addTMDbId(it.toString()) }
             }
         }
     }
